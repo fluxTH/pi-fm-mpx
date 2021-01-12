@@ -25,50 +25,28 @@
 */
 
 #include <sndfile.h>
+#include <soxr.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <string.h>
 #include <math.h>
-
-#include "rds.h"
-
-
-#define PI 3.141592654
-
-
-#define FIR_HALF_SIZE 30 
-#define FIR_SIZE (2*FIR_HALF_SIZE-1)
 
 
 size_t length;
-
-// coefficients of the low-pass FIR filter
-float low_pass_fir[FIR_HALF_SIZE];
-
-
-float carrier_38[] = {0.0, 0.8660254037844386, 0.8660254037844388, 1.2246467991473532e-16, -0.8660254037844384, -0.8660254037844386};
-
-float carrier_19[] = {0.0, 0.5, 0.8660254037844386, 1.0, 0.8660254037844388, 0.5, 1.2246467991473532e-16, -0.5, -0.8660254037844384, -1.0, -0.8660254037844386, -0.5};
-    
-int phase_38 = 0;
-int phase_19 = 0;
-
-
-float downsample_factor;
-
-
-float *audio_buffer;
-int audio_index = 0;
-int audio_len = 0;
-float audio_pos;
-
-float fir_buffer_mono[FIR_SIZE] = {0};
-float fir_buffer_stereo[FIR_SIZE] = {0};
-int fir_index = 0;
 int channels;
+int audio_rate;
+uint32_t mpx_rate;
+
+float *audio_buf = NULL;
+int audio_len = 0;
+
+float *leftover_buf = NULL;
+uint32_t leftover_len = 0;
+
+float resample_ratio;
 
 SNDFILE *inf;
-
-
+soxr_t soxr_h = NULL;
 
 float *alloc_empty_buffer(size_t length) {
     float *p = malloc(length * sizeof(float));
@@ -80,7 +58,7 @@ float *alloc_empty_buffer(size_t length) {
 }
 
 
-int fm_mpx_open(char *filename, size_t len) {
+int fm_mpx_open(char* filename, size_t len, uint32_t* mpx_rate_param) {
     length = len;
 
     if(filename != NULL) {
@@ -103,49 +81,59 @@ int fm_mpx_open(char *filename, size_t len) {
                 printf("Using audio file: %s\n", filename);
             }
         }
-            
-        int in_samplerate = sfinfo.samplerate;
-        downsample_factor = 228000. / in_samplerate;
-    
-        printf("Input: %d Hz, upsampling factor: %.2f\n", in_samplerate, downsample_factor);
-
-        channels = sfinfo.channels;
-        if(channels > 1) {
-            printf("%d channels, generating stereo multiplex.\n", channels);
-        } else {
-            printf("1 channel, monophonic operation.\n");
-        }
-    
-    
-        // Create the low-pass FIR filter
-        float cutoff_freq = 15000 * .8;
-        if(in_samplerate/2 < cutoff_freq) cutoff_freq = in_samplerate/2 * .8;
-    
-    
-    
-        low_pass_fir[FIR_HALF_SIZE-1] = 2 * cutoff_freq / 228000 /2;
-        // Here we divide this coefficient by two because it will be counted twice
-        // when applying the filter
-
-        // Only store half of the filter since it is symmetric
-        for(int i=1; i<FIR_HALF_SIZE; i++) {
-            low_pass_fir[FIR_HALF_SIZE-1-i] = 
-                sin(2 * PI * cutoff_freq * i / 228000) / (PI * i)      // sinc
-                * (.54 - .46 * cos(2*PI * (i+FIR_HALF_SIZE) / (2*FIR_HALF_SIZE)));
-                                                              // Hamming window
-        }
-        printf("Created low-pass FIR filter for audio channels, with cutoff at %.1f Hz\n", cutoff_freq);
-    
-        /*
-        for(int i=0; i<FIR_HALF_SIZE; i++) {
-            printf("%.5f ", low_pass_fir[i]);
-        }
-        printf("\n");
-        */
         
-        audio_pos = downsample_factor;
-        audio_buffer = alloc_empty_buffer(length * channels);
-        if(audio_buffer == NULL) return -1;
+        audio_rate = sfinfo.samplerate;
+
+        if (*mpx_rate_param == 0) {
+            if (audio_rate < 176400 || audio_rate > 228000) {
+                // TODO: Add resampler
+                fprintf(stderr, "Error: Input sample rate %d Hz not supported.\n", audio_rate);
+                return -1;
+            } else {
+                // MPX Rate = Input Rate
+                *mpx_rate_param = audio_rate;
+            }
+        }
+
+        mpx_rate = *mpx_rate_param;
+        channels = sfinfo.channels;
+
+        if (channels > 1) {
+            printf("%d channels detected, multichannel audio is not supported.\n", channels);
+            return -1;
+        }
+
+        printf("Input sample rate: %d Hz, 1 channel MPX ", audio_rate);
+        if (mpx_rate == audio_rate) {
+            printf("passthrough.\n");
+            resample_ratio = 1.f;
+        } else {
+            printf("resampled.\n");
+
+            soxr_error_t soxr_e;
+            soxr_h = soxr_create(
+                audio_rate, /* Input sample-rate. */
+                mpx_rate,   /* Output sample-rate. */
+                1,          /* Number of channels to be used. */
+
+                /* All following arguments are optional (may be set to NULL). */
+                &soxr_e,    /* To report any error during creation. */
+                NULL,       /* To specify non-default I/O formats. */
+                NULL,       /* To specify non-default resampling quality.*/
+                NULL
+            );
+
+            if (soxr_e != 0) {
+                fprintf(stderr, "Error: Resampling engine failed to initialize.\n");
+                return -1;
+            }
+
+            leftover_buf = alloc_empty_buffer(floor((float)length * 0.2f));
+            resample_ratio = (float)audio_rate / (float)mpx_rate;
+        }
+        
+        audio_buf = alloc_empty_buffer(floor((float)length / resample_ratio));
+        if(audio_buf == NULL) return -1;
 
     } // end if(filename != NULL)
     else {
@@ -156,99 +144,51 @@ int fm_mpx_open(char *filename, size_t len) {
     return 0;
 }
 
-
-// samples provided by this function are in 0..10: they need to be divided by
-// 10 after.
 int fm_mpx_get_samples(float *mpx_buffer) {
-    get_rds_samples(mpx_buffer, length);
-
     if(inf  == NULL) return 0; // if there is no audio, stop here
-    
-    for(int i=0; i<length; i++) {
-        if(audio_pos >= downsample_factor) {
-            audio_pos -= downsample_factor;
-            
-            if(audio_len == 0) {
-                for(int j=0; j<2; j++) { // one retry
-                    audio_len = sf_read_float(inf, audio_buffer, length);
-                    if (audio_len < 0) {
-                        fprintf(stderr, "Error reading audio\n");
-                        return -1;
-                    }
-                    if(audio_len == 0) {
-                        if( sf_seek(inf, 0, SEEK_SET) < 0 ) {
-                            fprintf(stderr, "Could not rewind in audio file, terminating\n");
-                            return -1;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                audio_index = 0;
-            } else {
-                audio_index += channels;
-                audio_len -= channels;
-            }
+
+    audio_len = 0;
+
+    int tries_left = 5;
+    int last_read_len;
+
+    int target_len = (float)length / resample_ratio;
+
+    do {
+        last_read_len = sf_read_float(inf, audio_buf + audio_len, target_len - audio_len);
+        if (last_read_len < 0) {
+            fprintf(stderr, "Error reading audio\n");
+            return -1;
         }
 
-        
-        // First store the current sample(s) into the FIR filter's ring buffer
-        if(channels == 0) {
-            fir_buffer_mono[fir_index] = audio_buffer[audio_index];
-        } else {
-            // In stereo operation, generate sum and difference signals
-            fir_buffer_mono[fir_index] = 
-                audio_buffer[audio_index] + audio_buffer[audio_index+1];
-            fir_buffer_stereo[fir_index] = 
-                audio_buffer[audio_index] - audio_buffer[audio_index+1];
-        }
-        fir_index++;
-        if(fir_index >= FIR_SIZE) fir_index = 0;
-        
-        // Now apply the FIR low-pass filter
-        
-        /* As the FIR filter is symmetric, we do not multiply all 
-           the coefficients independently, but two-by-two, thus reducing
-           the total number of multiplications by a factor of two
-        */
-        float out_mono = 0;
-        float out_stereo = 0;
-        int ifbi = fir_index;  // ifbi = increasing FIR Buffer Index
-        int dfbi = fir_index;  // dfbi = decreasing FIR Buffer Index
-        for(int fi=0; fi<FIR_HALF_SIZE; fi++) {  // fi = Filter Index
-            dfbi--;
-            if(dfbi < 0) dfbi = FIR_SIZE-1;
-            out_mono += 
-                low_pass_fir[fi] * 
-                    (fir_buffer_mono[ifbi] + fir_buffer_mono[dfbi]);
-            if(channels > 1) {
-                out_stereo += 
-                    low_pass_fir[fi] * 
-                        (fir_buffer_stereo[ifbi] + fir_buffer_stereo[dfbi]);
-            }
-            ifbi++;
-            if(ifbi >= FIR_SIZE) ifbi = 0;
-        }
-        // End of FIR filter
-        
+        audio_len += last_read_len;
+        tries_left--;
+    } while (audio_len < target_len && tries_left >= 0);
 
-        mpx_buffer[i] = 
-            mpx_buffer[i] +    // RDS data samples are currently in mpx_buffer
-            4.05*out_mono;     // Unmodulated monophonic (or stereo-sum) signal
-            
-        if(channels>1) {
-            mpx_buffer[i] +=
-                4.05 * carrier_38[phase_38] * out_stereo + // Stereo difference signal
-                .9*carrier_19[phase_19];                  // Stereo pilot tone
+    if (soxr_h != NULL && resample_ratio != 1.f) {
+        // Resampling enabled
+        soxr_error_t soxr_e = soxr_process(
+            soxr_h,
 
-            phase_19++;
-            phase_38++;
-            if(phase_19 >= 12) phase_19 = 0;
-            if(phase_38 >= 6) phase_38 = 0;
-        }
-            
-        audio_pos++;   
-        
+            /* Input (to be resampled): */
+            audio_buf,       /* Input buffer(s); may be NULL (see below). */
+            audio_len,          /* Input buf. length (samples per channel). */
+            NULL,               /* To return actual # samples used (<= ilen). */
+
+            /* Output (resampled): */
+            mpx_buffer,                         /* Output buffer(s).*/
+            (float)audio_len * resample_ratio,         /* Output buf. length (samples per channel). */
+            NULL
+        );
+
+        audio_len *= resample_ratio;
+    } else {
+        // Sample passthrough
+        memcpy(mpx_buffer, audio_buf, audio_len * sizeof(float));
+    }
+
+    if (audio_len < length) {
+        memset(mpx_buffer + audio_len, 0.f, length - audio_len);
     }
     
     return 0;
@@ -260,7 +200,9 @@ int fm_mpx_close() {
         fprintf(stderr, "Error closing audio file");
     }
     
-    if(audio_buffer != NULL) free(audio_buffer);
+    if (audio_buf != NULL) free(audio_buf);
+    if (leftover_buf != NULL) free(leftover_buf);
+    if (soxr_h != NULL) soxr_delete(soxr_h);
     
     return 0;
 }

@@ -104,11 +104,9 @@
 #include <sys/mman.h>
 #include <sndfile.h>
 
-#include "rds.h"
 #include "fm_mpx.h"
-#include "control_pipe.h"
-
 #include "mailbox.h"
+
 #define MBFILE            DEVICE_FILE_NAME    /* From mailbox.h */
 
 #if (RASPI)==1
@@ -133,7 +131,7 @@
 #error Unknown Raspberry Pi version (variable RASPI)
 #endif
 
-#define NUM_SAMPLES        50000
+#define NUM_SAMPLES        500000
 #define NUM_CBS            (NUM_SAMPLES * 2)
 
 #define BCM2708_DMA_NO_WIDE_BURSTS    (1<<26)
@@ -257,7 +255,6 @@ terminate(int num)
     }
     
     fm_mpx_close();
-    close_control_pipe();
 
     if (mbox.virt_addr != NULL) {
         unmapmem(mbox.virt_addr, NUM_PAGES * 4096);
@@ -314,10 +311,10 @@ map_peripheral(uint32_t base, uint32_t len)
 
 
 #define SUBSIZE 1
-#define DATA_SIZE 5000
+#define DATA_SIZE 20000
 
 
-int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt, float ppm, char *control_pipe) {
+int tx(uint32_t carrier_freq, char *audio_file, float ppm, uint32_t mpx_rate, float gain) {
     // Catch all signals possible - it is vital we kill the DMA engine
     // on process exit!
     for (int i = 0; i < 64; i++) {
@@ -394,6 +391,14 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     cbp--;
     cbp->next = mem_virt_to_phys(mbox.virt_addr);
 
+    // Data structures for baseband data
+    float data[DATA_SIZE];
+    int data_len = 0;
+    int data_index = 0;
+
+    // Initialize the baseband generator
+    if (mpx_buffer_open(audio_file, DATA_SIZE, &mpx_rate) < 0) return 1;
+
     // Here we define the rate at which we want to update the GPCLK control 
     // register.
     //
@@ -409,9 +414,11 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     //
     // So we use the 'ppm' parameter to compensate for the oscillator error
 
-    float divider = (PLLFREQ/(2000*228*(1.+ppm/1.e6)));
+    printf("Baseband MPX sample rate: %d Hz.\n", mpx_rate);
+
+    float divider = (PLLFREQ / (2000 * (mpx_rate / 1000.f) * (1. + ppm / 1.e6)));
     uint32_t idivider = (uint32_t) divider;
-    uint32_t fdivider = (uint32_t) ((divider - idivider)*pow(2, 12));
+    uint32_t fdivider = (uint32_t) ((divider - idivider) * pow(2, 12));
     
     printf("ppm corr is %.4f, divider is %.4f (%d + %d*2^-12) [nominal 1096.4912].\n", 
                 ppm, divider, idivider, fdivider);
@@ -443,67 +450,12 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     dma_reg[DMA_DEBUG] = 7; // clear debug error flags
     dma_reg[DMA_CS] = 0x10880001;    // go, mid priority, wait for outstanding writes
 
-    
     uint32_t last_cb = (uint32_t)ctl->cb;
-
-    // Data structures for baseband data
-    float data[DATA_SIZE];
-    int data_len = 0;
-    int data_index = 0;
-
-    // Initialize the baseband generator
-    if(fm_mpx_open(audio_file, DATA_SIZE) < 0) return 1;
-    
-    // Initialize the RDS modulator
-    char myps[9] = {0};
-    set_rds_pi(pi);
-    set_rds_rt(rt);
-    uint16_t count = 0;
-    uint16_t count2 = 0;
-    int varying_ps = 0;
-    
-    if(ps) {
-        set_rds_ps(ps);
-        printf("PI: %04X, PS: \"%s\".\n", pi, ps);
-    } else {
-        printf("PI: %04X, PS: <Varying>.\n", pi);
-        varying_ps = 1;
-    }
-    printf("RT: \"%s\"\n", rt);
-    
-    // Initialize the control pipe reader
-    if(control_pipe) {
-        if(open_control_pipe(control_pipe) == 0) {
-            printf("Reading control commands on %s.\n", control_pipe);
-        } else {
-            printf("Failed to open control pipe: %s.\n", control_pipe);
-            control_pipe = NULL;
-        }
-    }
-    
     
     printf("Starting to transmit on %3.1f MHz.\n", carrier_freq/1e6);
 
     for (;;) {
-        // Default (varying) PS
-        if(varying_ps) {
-            if(count == 512) {
-                snprintf(myps, 9, "%08d", count2);
-                set_rds_ps(myps);
-                count2++;
-            }
-            if(count == 1024) {
-                set_rds_ps("RPi-Live");
-                count = 0;
-            }
-            count++;
-        }
-        
-        if(control_pipe && poll_control_pipe() == CONTROL_PIPE_PS_SET) {
-            varying_ps = 0;
-        }
-        
-        usleep(5000);
+        usleep(3000);
 
         uint32_t cur_cb = mem_phys_to_virt(dma_reg[DMA_CONBLK_AD]);
         int last_sample = (last_cb - (uint32_t)mbox.virt_addr) / (sizeof(dma_cb_t) * 2);
@@ -523,7 +475,7 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
                 data_index = 0;
             }
             
-            float dval = data[data_index] * (DEVIATION / 10.);
+            float dval = data[data_index] * DEVIATION * gain;
             data_index++;
             data_len--;
 
@@ -546,13 +498,10 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
 
 int main(int argc, char **argv) {
     char *audio_file = NULL;
-    char *control_pipe = NULL;
     uint32_t carrier_freq = 107900000;
-    char *ps = NULL;
-    char *rt = "PiFmRds: live FM-RDS transmission from the RaspberryPi";
-    uint16_t pi = 0x1234;
     float ppm = 0;
-    
+    uint32_t mpx_rate = 0;
+    float gain = 1.0f;
     
     // Parse command-line arguments
     for(int i=1; i<argc; i++) {
@@ -561,37 +510,34 @@ int main(int argc, char **argv) {
         
         if(arg[0] == '-' && i+1 < argc) param = argv[i+1];
         
-        if((strcmp("-wav", arg)==0 || strcmp("-audio", arg)==0) && param != NULL) {
+        if(strcmp("-input", arg)==0 && param != NULL) {
             i++;
             audio_file = param;
         } else if(strcmp("-freq", arg)==0 && param != NULL) {
             i++;
             carrier_freq = 1e6 * atof(param);
             if(carrier_freq < 76e6 || carrier_freq > 108e6)
-                fatal("Incorrect frequency specification. Must be in megahertz, of the form 107.9, between 76 and 108.\n");
-        } else if(strcmp("-pi", arg)==0 && param != NULL) {
+                fatal("Frequency must be between 76 MHz and 108 MHz.\n");
+        } else if(strcmp("-rate", arg)==0 && param != NULL) {
             i++;
-            pi = (uint16_t) strtol(param, NULL, 16);
-        } else if(strcmp("-ps", arg)==0 && param != NULL) {
-            i++;
-            ps = param;
-        } else if(strcmp("-rt", arg)==0 && param != NULL) {
-            i++;
-            rt = param;
-        } else if(strcmp("-ppm", arg)==0 && param != NULL) {
+            mpx_rate = atoi(param);
+            if (mpx_rate != 0 && (mpx_rate < 176400 || mpx_rate > 228000))
+                fatal("MPX Rate must be between 176400 Hz and 228000 Hz\n");
+        } else if (strcmp("-ppm", arg)==0 && param != NULL) {
             i++;
             ppm = atof(param);
-        } else if(strcmp("-ctl", arg)==0 && param != NULL) {
+        } else if(strcmp("-gain", arg)==0 && param != NULL) {
             i++;
-            control_pipe = param;
+            gain = atof(param);
+            if (gain < 0.0f || gain > 3.0f)
+                fatal("Gain must be between 0.0 and 3.0\n");
         } else {
-            fatal("Unrecognised argument: %s.\n"
-            "Syntax: pi_fm_rds [-freq freq] [-audio file] [-ppm ppm_error] [-pi pi_code]\n"
-            "                  [-ps ps_text] [-rt rt_text] [-ctl control_pipe]\n", arg);
+            fatal("Invalid argument: %s.\n"
+            "Syntax: pi-fm-mpx <-audio file> [-freq 107.9] [-rate auto|192000] [-ppm 0] [-gain 1.0]\n", arg);
         }
     }
     
-    int errcode = tx(carrier_freq, audio_file, pi, ps, rt, ppm, control_pipe);
+    int errcode = tx(carrier_freq, audio_file, ppm, mpx_rate, gain);
     
     terminate(errcode);
 }

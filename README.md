@@ -1,6 +1,8 @@
-Pi-FM-RDS
+Pi-FM-MPX
 =========
 
+FM-MPX transmitter based on the Pi-FM-RDS project.
+Documentation coming soon...
 
 ## FM-RDS transmitter using the Raspberry Pi
 
