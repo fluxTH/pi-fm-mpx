@@ -41,7 +41,7 @@ If `make` reports no error (i.e. the `pi_fm_mpx` executable gets generated), you
 ffmpeg -i mpx.flac -c:a pcm_s16le -f wav - | sudo ./pi_fm_mpx -audio -
 ```
 
-This will generate an FM transmission on 107.9 MHz, with default station name (PS), radiotext (RT) and PI-code, without audio. The radiofrequency signal is emitted on GPIO 4 (pin 7 on header P1).
+This will generate an FM transmission on 107.9 MHz, with the decoded MPX data from ffmpeg. The radiofrequency signal is emitted on GPIO 4 (pin 7 on header P1).
 
 The more general syntax for running Pi-FM-MPX is as follows:
 
